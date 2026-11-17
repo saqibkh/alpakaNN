@@ -2,12 +2,15 @@ name: GPU tests (simulated)
 
 # Optional, non-required check. The hosted runners have no GPU, so this builds
 # the unit tests with the alpaka CUDA backend (host CPU devices disabled) and
-# runs them on a simulated NVIDIA H100
+# runs them on a simulated NVIDIA H100; a second job builds the HIP backend
+# and runs them on a simulated AMD MI300X
 # (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
 # hardware-specific behaviour or timing, so it complements real-GPU testing and
 # does not replace it.
 
 on:
+  push:
+    branches: [scratch-hip-sim]
   workflow_dispatch:
   pull_request:
     paths:
@@ -86,6 +89,72 @@ jobs:
             grep -q 'virtual GPU platform initialized' "logs/$n.log" || { echo "::error::$n did not run on the virtual GPU"; exit 1; }
             grep -Eq 'All tests passed \([0-9]+ assertions? in [0-9]+ test cases?\)' "logs/$n.log" || { echo "::error::$n: no pass summary"; exit 1; }
             if grep -Eqi 'No device available|VirtualGPU error|CUDA error|no CUDA-capable|skipped' "logs/$n.log"; then
+              echo "::error::$n: device missing, error or skipped test"; exit 1
+            fi
+          done
+
+  hip-sim:
+    name: HIP (ROCm 7.2), simulated MI300X
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      # ROCm 7.2 and not 7.1: the 7.1 compiler has a known fp16 miscompile
+      # (ROCm/llvm-project#5478).
+      - name: Set up the simulated GPU and ROCm
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: amd/mi300x
+          cuda-toolkit: none
+          rocm: "7.2"
+          library-path: "false"
+
+      # The action installs only the compiler side. rocBLAS and rocFFT are the
+      # vendor backends alpakaVendor requires for HIP.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y comgr hsa-rocr rocm-cmake rocblas-dev rocfft-dev ninja-build libopenblas-dev libfftw3-dev
+
+      # alpaka_HOST_Cpu=OFF removes the host CPU device specs, so every test
+      # case can only run on the HIP device.
+      - name: Configure
+        run: |
+          export ROCM_PATH=/opt/rocm
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+            -DCMAKE_HIP_COMPILER=/opt/rocm/lib/llvm/bin/clang++ \
+            -DCMAKE_PREFIX_PATH=/opt/rocm \
+            -Dalpaka_DEP_HIP=ON \
+            -Dalpaka_HIP_AmdGpu=ON \
+            -Dalpaka_DEP_OMP=OFF \
+            -Dalpaka_HOST_Cpu=OFF \
+            -Dalpaka_DEP_HWLOC=OFF \
+            -DCMAKE_HIP_ARCHITECTURES=gfx942
+
+      - name: Build
+        run: vgpu run --preload cmake --build build -j3
+
+      # Same guards as the CUDA job.
+      - name: Run the unit tests
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          tests=$(find build/test -maxdepth 1 -type f -perm -u+x -name 'unit_test_*' ! -name '*.cmake' | sort)
+          test -n "$tests"
+          for t in $tests; do
+            n=$(basename "$t")
+            echo "::group::$n"
+            vgpu run --gpu amd/mi300x "$t" -s 2>&1 | tee "logs/$n.log"
+            echo "::endgroup::"
+            grep -q 'virtual GPU platform initialized' "logs/$n.log" || { echo "::error::$n did not run on the virtual GPU"; exit 1; }
+            grep -Eq 'All tests passed \([0-9]+ assertions? in [0-9]+ test cases?\)' "logs/$n.log" || { echo "::error::$n: no pass summary"; exit 1; }
+            if grep -Eqi 'No device available|VirtualGPU error|HIP error|hipError|no ROCm-capable|skipped' "logs/$n.log"; then
               echo "::error::$n: device missing, error or skipped test"; exit 1
             fi
           done
