@@ -78,7 +78,7 @@ jobs:
         run: |
           set -o pipefail
           mkdir -p logs
-          tests=$(find build/test -maxdepth 1 -type f -name 'unit_test_*' | sort)
+          tests=$(find build/test -maxdepth 1 -type f -perm -u+x -name 'unit_test_*' ! -name '*.cmake' | sort)
           test -n "$tests"
           for t in $tests; do
             n=$(basename "$t")
