@@ -1,0 +1,91 @@
+name: GPU tests (simulated)
+
+# Optional, non-required check. The hosted runners have no GPU, so this builds
+# the unit tests with the alpaka CUDA backend (host CPU devices disabled) and
+# runs them on a simulated NVIDIA H100
+# (https://github.com/pantheongpu/pantheonsim). A simulator cannot reproduce
+# hardware-specific behaviour or timing, so it complements real-GPU testing and
+# does not replace it.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "include/**"
+      - "test/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - ".github/workflows/gpu-sim.yml"
+
+concurrency:
+  group: gpu-sim-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cuda-sim:
+    name: CUDA 13.0, simulated H100
+    runs-on: ubuntu-24.04
+    timeout-minutes: 150
+
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up the simulated GPU and CUDA toolkit
+        uses: pantheongpu/setup-pantheonsim@deff5781e8adfd83dec98dd5242dcbc96a564773 # v0.1.10
+        with:
+          gpu: nvidia/h100
+          cuda-toolkit: "13.0"
+          library-path: "false"
+
+      # OpenBLAS and FFTW3 are the host backends alpakaVendor requires.
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build libopenblas-dev libfftw3-dev
+
+      # 90-virtual embeds compute_90 PTX only: the simulator JIT-compiles PTX
+      # and does not run SASS. The shared CUDA runtime is required by the
+      # simulator. alpaka_HOST_Cpu=OFF removes the host CPU device specs, so
+      # every test case can only run on the CUDA device.
+      - name: Configure
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -Dalpaka_DEP_CUDA=ON \
+            -Dalpaka_HOST_Cpu=OFF \
+            -Dalpaka_DEP_HWLOC=OFF \
+            -DCMAKE_CUDA_ARCHITECTURES=90-virtual \
+            -DCMAKE_CUDA_RUNTIME_LIBRARY=Shared
+
+      # Catch2 test discovery runs the test executables during the build.
+      - name: Build
+        run: vgpu run --preload cmake --build build -j3
+
+      # The test cases return early with a passing "No device available"
+      # message when the device is missing, so each Catch2 executable is run
+      # with -s (report passed assertions). The step fails on a non-zero exit
+      # code, on that message, on a CUDA or simulator error, on skipped tests,
+      # and unless the virtual GPU was initialized and at least one test case
+      # passed.
+      - name: Run the unit tests
+        run: |
+          set -o pipefail
+          mkdir -p logs
+          tests=$(find build/test -maxdepth 1 -type f -name 'unit_test_*' | sort)
+          test -n "$tests"
+          for t in $tests; do
+            n=$(basename "$t")
+            echo "::group::$n"
+            vgpu run --gpu nvidia/h100 "$t" -s 2>&1 | tee "logs/$n.log"
+            echo "::endgroup::"
+            grep -q 'virtual GPU platform initialized' "logs/$n.log" || { echo "::error::$n did not run on the virtual GPU"; exit 1; }
+            grep -Eq 'All tests passed \([0-9]+ assertions? in [0-9]+ test cases?\)' "logs/$n.log" || { echo "::error::$n: no pass summary"; exit 1; }
+            if grep -Eqi 'No device available|VirtualGPU error|CUDA error|no CUDA-capable|skipped' "logs/$n.log"; then
+              echo "::error::$n: device missing, error or skipped test"; exit 1
+            fi
+          done
