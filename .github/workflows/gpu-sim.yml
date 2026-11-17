@@ -86,7 +86,7 @@ jobs:
             echo "::group::$n"
             vgpu run --gpu nvidia/h100 "$t" -s 2>&1 | tee "logs/$n.log"
             echo "::endgroup::"
-            grep -q 'virtual GPU platform initialized' "logs/$n.log" || echo "::warning::$n no init line"
+            grep -q 'virtual GPU platform initialized' "logs/$n.log" || { echo "::error::$n did not run on the virtual GPU"; exit 1; }
             grep -Eq 'All tests passed \([0-9]+ assertions? in [0-9]+ test cases?\)' "logs/$n.log" || { echo "::error::$n: no pass summary"; exit 1; }
             if grep -Eqi 'No device available|VirtualGPU error|CUDA error|no CUDA-capable|skipped' "logs/$n.log"; then
               echo "::error::$n: device missing, error or skipped test"; exit 1
@@ -140,16 +140,13 @@ jobs:
       - name: Build
         run: vgpu run --preload cmake --build build -j3
 
-      # Same guards as the CUDA job. A test executable that does not link the
-      # HIP runtime (core_layout only checks compile-time layout tags) never
-      # starts the virtual GPU, so the initialization check applies to the
-      # executables that link it, and at least one of them must exist.
-
+      # Same guards as the CUDA job, except for the initialization line: the
+      # HIP runtime does not print it. Instead, the matmul test reports the
+      # device it ran on (-s), and that line must name the simulated MI300X.
       - name: Run the unit tests
         run: |
           set -o pipefail
           mkdir -p logs
-          ndev=0
           tests=$(find build/test -maxdepth 1 -type f -perm -u+x -name 'unit_test_*' ! -name '*.cmake' | sort)
           test -n "$tests"
           for t in $tests; do
@@ -157,15 +154,9 @@ jobs:
             echo "::group::$n"
             vgpu run --gpu amd/mi300x "$t" -s 2>&1 | tee "logs/$n.log"
             echo "::endgroup::"
-            if ldd "$t" | grep -q libamdhip64; then
-              ndev=$((ndev + 1))
-              grep -q 'virtual GPU platform initialized' "logs/$n.log" || echo "::warning::$n no init line"
-            else
-              echo "$n does not link the HIP runtime (host-only test)"
-            fi
             grep -Eq 'All tests passed \([0-9]+ assertions? in [0-9]+ test cases?\)' "logs/$n.log" || { echo "::error::$n: no pass summary"; exit 1; }
             if grep -Eqi 'No device available|VirtualGPU error|HIP error|hipError|no ROCm-capable|skipped' "logs/$n.log"; then
               echo "::error::$n: device missing, error or skipped test"; exit 1
             fi
           done
-          test "$ndev" -gt 0 || { echo "::error::no test executable used the HIP runtime"; exit 1; }
+          grep -q 'device=AMD Instinct MI300X' logs/unit_test_matrix_matmul.log || { echo "::error::no test reported the simulated MI300X"; exit 1; }
